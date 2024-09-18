@@ -1,3 +1,4 @@
+// Dependencies
 #include <filesystem>
 #include <nlohmann/json.hpp>
 #include "opensplat.hpp"
@@ -7,10 +8,12 @@
 #include "constants.hpp"
 #include <cxxopts.hpp>
 
+// Namespace
 namespace fs = std::filesystem;
 using namespace torch::indexing;
 
 int main(int argc, char *argv[]){
+    // Create a cxxopts::Options class, used to define and parse command line arguments
     cxxopts::Options options("opensplat", "Open Source 3D Gaussian Splats generator - " APP_VERSION);
     options.add_options()
         ("i,input", "Path to nerfstudio project", cxxopts::value<std::string>())
@@ -42,6 +45,7 @@ int main(int argc, char *argv[]){
         ;
     options.parse_positional({ "input" });
     options.positional_help("[colmap/nerfstudio/opensfm/odm project path]");
+    // Command line arguments parsing and error handling
     cxxopts::ParseResult result;
     try {
         result = options.parse(argc, argv);
@@ -61,8 +65,10 @@ int main(int argc, char *argv[]){
         return EXIT_SUCCESS;
     }
 
-
+    // Parameters from user input
+    // Input path
     const std::string projectRoot = result["input"].as<std::string>();
+    // Output path
     const std::string outputScene = result["output"].as<std::string>();
     const int saveEvery = result["save-every"].as<int>(); 
     const bool validate = result.count("val") > 0 || result.count("val-render") > 0;
@@ -71,6 +77,7 @@ int main(int argc, char *argv[]){
     if (!valRender.empty() && !fs::exists(valRender)) fs::create_directories(valRender);
     const bool keepCrs = result.count("keep-crs") > 0;
     const float downScaleFactor = (std::max)(result["downscale-factor"].as<float>(), 1.0f);
+    // Iteration number
     const int numIters = result["num-iters"].as<int>();
     const int numDownscales = result["num-downscales"].as<int>();
     const int resolutionSchedule = result["resolution-schedule"].as<int>();
@@ -85,23 +92,28 @@ int main(int argc, char *argv[]){
     const int stopScreenSizeAt = result["stop-screen-size-at"].as<int>();
     const float splitScreenSize = result["split-screen-size"].as<float>();
 
+    // Device selection
     torch::Device device = torch::kCPU;
     int displayStep = 10;
-
+    // CUDA
     if (torch::hasCUDA() && result.count("cpu") == 0) {
         std::cout << "Using CUDA" << std::endl;
         device = torch::kCUDA;
+    // MPS
     } else if (torch::hasMPS() && result.count("cpu") == 0) {
         std::cout << "Using MPS" << std::endl;
         device = torch::kMPS;
+    // CPU
     }else{
         std::cout << "Using CPU" << std::endl;
         displayStep = 1;
     }
 
     try{
+        // Input data in specified format
         InputData inputData = inputDataFromX(projectRoot);
 
+        // Parallel load images, downscale images
         parallel_for(inputData.cameras.begin(), inputData.cameras.end(), [&downScaleFactor](Camera &cam){
             cam.loadImage(downScaleFactor);
         });
@@ -111,6 +123,7 @@ int main(int argc, char *argv[]){
         std::vector<Camera> cams = std::get<0>(t);
         Camera *valCam = std::get<1>(t);
 
+        // Initialize model
         Model model(inputData,
                     cams.size(),
                     numDownscales, resolutionSchedule, shDegree, shDegreeInterval, 
@@ -123,6 +136,7 @@ int main(int argc, char *argv[]){
         InfiniteRandomIterator<size_t> camsIter( camIndices );
 
         int imageSize = -1;
+        // Training iteration
         for (size_t step = 1; step <= numIters; step++){
             Camera& cam = cams[ camsIter.next() ];
 
@@ -141,11 +155,13 @@ int main(int argc, char *argv[]){
             model.schedulersStep(step);
             model.afterTrain(step);
 
+            // Periodically save output images
             if (saveEvery > 0 && step % saveEvery == 0){
                 fs::path p(outputScene);
                 model.save((p.replace_filename(fs::path(p.stem().string() + "_" + std::to_string(step) + p.extension().string())).string()));
             }
 
+            // If activating validation, periodically save validation images
             if (!valRender.empty() && step % 10 == 0){
                 torch::Tensor rgb = model.forward(*valCam, step);
                 cv::Mat image = tensorToImage(rgb.detach().cpu());
