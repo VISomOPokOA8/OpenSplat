@@ -80,7 +80,7 @@ struct Model{
   void optimizersStep();
   void schedulersStep(int step);
   int getDownscaleFactor(int step);
-  void afterTrain(int step);
+  std::tuple<bool, std::chrono::duration<double, std::milli>, std::chrono::duration<double, std::milli>, std::chrono::duration<double, std::milli>, std::chrono::duration<double, std::milli>, int, int, int> afterTrain(int step);
   void save(const std::string &filename);
   void savePly(const std::string &filename);
   void saveSplat(const std::string &filename);

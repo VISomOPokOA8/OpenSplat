@@ -6,6 +6,8 @@
 #include "rasterize_gaussians.hpp"
 #include "tensor_math.hpp"
 #include "gsplat.hpp"
+#include <chrono>
+#include <tuple>
 
 #ifdef USE_HIP
 #include <c10/hip/HIPCachingAllocator.h>
@@ -278,78 +280,100 @@ void Model::removeFromOptimizer(torch::optim::Adam *optimizer, const torch::Tens
     optimizer->state()[newPId] = std::move(paramState);
 }
 
-void Model::afterTrain(int step){
-    torch::NoGradGuard noGrad;
+std::tuple<bool, std::chrono::duration<double, std::milli>, std::chrono::duration<double, std::milli>, std::chrono::duration<double, std::milli>, std::chrono::duration<double, std::milli>, int, int, int> Model::afterTrain(int step){
+    torch::NoGradGuard noGrad; // Disable gradient calculation since this part doesn't need it
 
+    // If the step is less than stopSplitAt, update gradient norms and maximum size for 2D screen space
     if (step < stopSplitAt){
-        torch::Tensor visibleMask = (radii > 0).flatten();
-        
-        torch::Tensor grads = torch::linalg::vector_norm(xys.grad().detach(), 2, { -1 }, false, torch::kFloat32);
+        torch::Tensor visibleMask = (radii > 0).flatten(); // Find points with positive radii
+        torch::Tensor grads = torch::linalg::vector_norm(xys.grad().detach(), 2, { -1 }, false, torch::kFloat32); // Compute gradient norms for xys
+        // Initialize or update gradient norms and visibility counts
         if (!xysGradNorm.numel()){
             xysGradNorm = grads;
             visCounts = torch::ones_like(xysGradNorm);
         }else{
-            visCounts.index_put_({visibleMask}, visCounts.index({visibleMask}) + 1);
-            xysGradNorm.index_put_({visibleMask}, grads.index({visibleMask}) + xysGradNorm.index({visibleMask}));
+            visCounts.index_put_({visibleMask}, visCounts.index({visibleMask}) + 1); // Increment visibility count
+            xysGradNorm.index_put_({visibleMask}, grads.index({visibleMask}) + xysGradNorm.index({visibleMask})); // Accumulate gradient norms
         }
 
+        // Initialize or update the maximum 2D size based on radii
         if (!max2DSize.numel()){
             max2DSize = torch::zeros_like(radii, torch::kFloat32);
         }
 
-        torch::Tensor newRadii = radii.detach().index({visibleMask});
+        torch::Tensor newRadii = radii.detach().index({visibleMask}); // Get visible radii
         max2DSize.index_put_({visibleMask}, torch::maximum(
                 max2DSize.index({visibleMask}), newRadii / static_cast<float>( (std::max)(lastHeight, lastWidth) )
             ));
     }
 
+    bool doDensification = false;
+    std::chrono::duration<double, std::milli> split_elapsed, duplicate_elapsed, concatenation_elapsed, cull_elapsed;
+    int add_gaussian, cull_gaussian, remain_gaussian;
+
+    // Densification
+    // Executed at intervals defined by refineEvery and after warmupLength steps
     if (step % refineEvery == 0 && step > warmupLength){
         int resetInterval = resetAlphaEvery * refineEvery;
-        bool doDensification = step < stopSplitAt && step % resetInterval > numCameras + refineEvery;
-        torch::Tensor splitsMask;
-        const float cullAlphaThresh = 0.1f;
+        doDensification = step < stopSplitAt && step % resetInterval > numCameras + refineEvery; // Check if densification should occur
+        torch::Tensor splitsMask; // Mask for split points
+        const float cullAlphaThresh = 0.1f; // Threshold for culling based on alpha
 
+        // Perform densification (adding more points if necessary)
         if (doDensification){
-            int numPointsBefore = means.size(0);
+            int numPointsBefore = means.size(0); // Record the number of points before densification
             torch::Tensor avgGradNorm = (xysGradNorm / visCounts) * 0.5f * static_cast<float>( (std::max)(lastWidth, lastHeight) );
-            torch::Tensor highGrads = (avgGradNorm > densifyGradThresh).squeeze();
+            torch::Tensor highGrads = (avgGradNorm > densifyGradThresh).squeeze(); // Find high gradient points
 
             // Split gaussians that are too large
-            torch::Tensor splits = (std::get<0>(scales.exp().max(-1)) > densifySizeThresh).squeeze();
+            auto start = std::chrono::high_resolution_clock::now();
+
+            torch::Tensor splits = (std::get<0>(scales.exp().max(-1)) > densifySizeThresh).squeeze(); // Find gaussians larger than threshold
             if (step < stopScreenSizeAt){
-                splits |= (max2DSize > splitScreenSize).squeeze();
+                splits |= (max2DSize > splitScreenSize).squeeze(); // Split if size exceeds screen threshold
             }
 
-            splits &= highGrads;
-            const int nSplitSamples = 2;
-            int nSplits = splits.sum().item<int>();
+            splits &= highGrads; // Only split gaussians with high gradient
+            const int nSplitSamples = 2; // Number of samples to split
+            int nSplits = splits.sum().item<int>(); // Count the splits
 
             torch::Tensor centeredSamples = torch::randn({nSplitSamples * nSplits, 3}, device);  // Nx3 of axis-aligned scales
-            torch::Tensor scaledSamples = torch::exp(scales.index({splits}).repeat({nSplitSamples, 1})) * centeredSamples;
-            torch::Tensor qs = quats.index({splits}) / torch::linalg::vector_norm(quats.index({splits}), 2, { -1 }, true, torch::kFloat32);
-            torch::Tensor rots = quatToRotMat(qs.repeat({nSplitSamples, 1}));
-            torch::Tensor rotatedSamples = torch::bmm(rots, scaledSamples.index({"...", None})).squeeze();
-            torch::Tensor splitMeans = rotatedSamples + means.index({splits}).repeat({nSplitSamples, 1});
+            torch::Tensor scaledSamples = torch::exp(scales.index({splits}).repeat({nSplitSamples, 1})) * centeredSamples; // Scale samples
+            torch::Tensor qs = quats.index({splits}) / torch::linalg::vector_norm(quats.index({splits}), 2, { -1 }, true, torch::kFloat32); // Normalize quaternions
+            torch::Tensor rots = quatToRotMat(qs.repeat({nSplitSamples, 1})); // Convert quaternions to rotation matrices
+            torch::Tensor rotatedSamples = torch::bmm(rots, scaledSamples.index({"...", None})).squeeze(); // Rotate samples
+            torch::Tensor splitMeans = rotatedSamples + means.index({splits}).repeat({nSplitSamples, 1}); // Calculate new means for splits
             
-            torch::Tensor splitFeaturesDc = featuresDc.index({splits}).repeat({nSplitSamples, 1});
+            torch::Tensor splitFeaturesDc = featuresDc.index({splits}).repeat({nSplitSamples, 1}); // Duplicate features for splits
             torch::Tensor splitFeaturesRest = featuresRest.index({splits}).repeat({nSplitSamples, 1, 1});
             
-            torch::Tensor splitOpacities = opacities.index({splits}).repeat({nSplitSamples, 1});
+            torch::Tensor splitOpacities = opacities.index({splits}).repeat({nSplitSamples, 1}); // Duplicate opacities
         
             const float sizeFac = 1.6f;
-            torch::Tensor splitScales = torch::log(torch::exp(scales.index({splits})) / sizeFac).repeat({nSplitSamples, 1});
-            scales.index({splits}) = torch::log(torch::exp(scales.index({splits})) / sizeFac);
-            torch::Tensor splitQuats = quats.index({splits}).repeat({nSplitSamples, 1});
+            torch::Tensor splitScales = torch::log(torch::exp(scales.index({splits})) / sizeFac).repeat({nSplitSamples, 1}); // Update scales for splits
+            scales.index({splits}) = torch::log(torch::exp(scales.index({splits})) / sizeFac); // Update original scales
+            torch::Tensor splitQuats = quats.index({splits}).repeat({nSplitSamples, 1}); // Duplicate quaternions
+
+            auto end = std::chrono::high_resolution_clock::now();
+            split_elapsed = end - start;
 
             // Duplicate gaussians that are too small
-            torch::Tensor dups = (std::get<0>(scales.exp().max(-1)) <= densifySizeThresh).squeeze();
-            dups &= highGrads;
-            torch::Tensor dupMeans = means.index({dups});
+            start = std::chrono::high_resolution_clock::now();
+
+            torch::Tensor dups = (std::get<0>(scales.exp().max(-1)) <= densifySizeThresh).squeeze(); // Find small gaussians
+            dups &= highGrads; // Only keep those with high gradients
+            torch::Tensor dupMeans = means.index({dups}); // Duplicate data for these points
             torch::Tensor dupFeaturesDc = featuresDc.index({dups});
             torch::Tensor dupFeaturesRest = featuresRest.index({dups});
             torch::Tensor dupOpacities = opacities.index({dups});
             torch::Tensor dupScales = scales.index({dups});
             torch::Tensor dupQuats = quats.index({dups});
+
+            end = std::chrono::high_resolution_clock::now();
+            duplicate_elapsed = end - start;
+
+            // Concatenate the new splits and duplications into the original tensors
+            start = std::chrono::high_resolution_clock::now();
 
             means = torch::cat({means.detach(), splitMeans, dupMeans}, 0).requires_grad_();
             featuresDc = torch::cat({featuresDc.detach(), splitFeaturesDc, dupFeaturesDc}, 0).requires_grad_();
@@ -358,14 +382,16 @@ void Model::afterTrain(int step){
             scales = torch::cat({scales.detach(), splitScales, dupScales}, 0).requires_grad_();
             quats = torch::cat({quats.detach(), splitQuats, dupQuats}, 0).requires_grad_();
             
+            // Add zero entries for the new points' max 2D size
             max2DSize = torch::cat({
                 max2DSize,
                 torch::zeros_like(splitScales.index({Slice(), 0})),
                 torch::zeros_like(dupScales.index({Slice(), 0}))
             }, 0);
 
-            torch::Tensor splitIdcs = torch::where(splits)[0];
+            torch::Tensor splitIdcs = torch::where(splits)[0]; // Get indices of splits
 
+            // Add the new split points to the optimizer
             addToOptimizer(meansOpt, means, splitIdcs, nSplitSamples);
             addToOptimizer(scalesOpt, scales, splitIdcs, nSplitSamples);
             addToOptimizer(quatsOpt, quats, splitIdcs, nSplitSamples);
@@ -373,7 +399,7 @@ void Model::afterTrain(int step){
             addToOptimizer(featuresRestOpt, featuresRest, splitIdcs, nSplitSamples);
             addToOptimizer(opacitiesOpt, opacities, splitIdcs, nSplitSamples);
             
-            torch::Tensor dupIdcs = torch::where(dups)[0];
+            torch::Tensor dupIdcs = torch::where(dups)[0]; // Get indices of duplications
             addToOptimizer(meansOpt, means, dupIdcs, 1);
             addToOptimizer(scalesOpt, scales, dupIdcs, 1);
             addToOptimizer(quatsOpt, quats, dupIdcs, 1);
@@ -381,15 +407,22 @@ void Model::afterTrain(int step){
             addToOptimizer(featuresRestOpt, featuresRest, dupIdcs, 1);
             addToOptimizer(opacitiesOpt, opacities, dupIdcs, 1);
 
+            // Create splitsMask to track splits for later use
             splitsMask = torch::cat({
                 splits,
                 torch::full({nSplitSamples * splits.sum().item<int>() + dups.sum().item<int>()}, false, torch::TensorOptions().dtype(torch::kBool).device(device))
             }, 0);
 
-            std::cout << "Added " << (means.size(0) - numPointsBefore) << " gaussians, new count " << means.size(0) << std::endl;
+            add_gaussian = means.size(0) - numPointsBefore;
+            // std::cout << "Added " << (means.size(0) - numPointsBefore) << " gaussians, new count " << means.size(0) << std::endl;
+
+            end = std::chrono::high_resolution_clock::now();
+            concatenation_elapsed = end - start;
         }
 
         if (doDensification){
+            auto start = std::chrono::high_resolution_clock::now();
+
             // Cull
             int numPointsBefore = means.size(0);
 
@@ -408,6 +441,9 @@ void Model::afterTrain(int step){
                 culls |= huge;
             }
 
+            auto end = std::chrono::high_resolution_clock::now();
+            cull_elapsed = end - start;
+
             int cullCount = torch::sum(culls).item<int>();
             if (cullCount > 0){
                 means = means.index({~culls}).detach().requires_grad_();
@@ -424,7 +460,9 @@ void Model::afterTrain(int step){
                 removeFromOptimizer(featuresRestOpt, featuresRest, culls);
                 removeFromOptimizer(opacitiesOpt, opacities, culls);
                 
-                std::cout << "Culled " << (numPointsBefore - means.size(0)) << " gaussians, remaining " << means.size(0) << std::endl;
+                cull_gaussian = numPointsBefore - means.size(0);
+                remain_gaussian = means.size(0);
+                // std::cout << "Culled " << (numPointsBefore - means.size(0)) << " gaussians, remaining " << means.size(0) << std::endl;
             }
         }
 
@@ -458,6 +496,8 @@ void Model::afterTrain(int step){
             #endif
         }
     }
+
+    return std::make_tuple(doDensification, split_elapsed, duplicate_elapsed, concatenation_elapsed, cull_elapsed, add_gaussian, cull_gaussian, remain_gaussian);
 }
 
 void Model::save(const std::string &filename){
